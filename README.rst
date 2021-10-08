@@ -59,8 +59,8 @@ server.
     # Provide enough information to launch the Mozilla
     # geckodriver and submit the appointment form.
     selenium_info = dmvision.SeleniumInfo\
-        ( geckodriver_path = "/path/to/geckodriver"
-        , autofill = dmvision.knowledge_autofill
+        ( autofill = dmvision.knowledge_autofill
+        , geckodriver_path = "/path/to/geckodriver"
         )
 
     # Configure the service as required though the

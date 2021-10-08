@@ -80,12 +80,22 @@ class TwilioInfo:
 
 @dataclasses.dataclass
 class SeleniumInfo:
-    geckodriver_path: str
     autofill: typing.Callable[..., typing.Optional[bool]]
+    geckodriver_path: typing.Optional[str] = None
+    _driver: typing.Optional[selenium.webdriver.Firefox] =\
+        dataclasses.field(init=False, default=None)
 
-    def __post_init__(self):
-        self.driver = selenium.webdriver.Firefox\
-            (executable_path=self.geckodriver_path)
+    @property
+    def driver(self):
+        if self._driver is None:
+            self._driver = self.start_driver()
+        return self._driver
+
+    def start_driver(self):
+        args = {}
+        if self.geckodriver_path:
+            args["executable_path"] = self.geckodriver_path
+        return selenium.webdriver.Firefox(**args)
 
 
 @dataclasses.dataclass
