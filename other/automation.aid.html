@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<!-- Implementing some great advice:
+    * https://stackoverflow.com/a/67180588
+    * https://stackoverflow.com/a/8993124
+    * https://css-tricks.com/left-and-right/
+    * https://www.w3.org/Style/Examples/007/center.en.html
+-->
+<html lang="en">
+<head>
+<meta chaset="UTF-8"/>
+<title>Selenium Automation Aid</title>
+<style>
+html, body {
+    height: 100%;
+    margin: 0;
+}
+body {
+    padding: 8px;
+    box-sizing: border-box;
+}
+.container {
+    display: flex;
+    height: 100%;
+    width: 100%;
+}
+.left, .right {
+    flex: 1;
+    height: 20em;
+    max-height: 100%;
+}
+.left {
+    background-color: darkgrey;
+    align-self: flex-start;
+}
+.right {
+    background-color: yellow;
+    align-self: flex-end;
+}
+.buttondiv {
+    display: flex;
+    flex-direction: column;
+    min-height: 100%;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    /*
+    small: em too large
+    large: em decent
+    small: pc decent
+    large: pc too large
+    padding: min(1em, 10%);
+    padding: 20%;
+    padding: 0.5em;
+    */
+    padding: min(1em, 10%);
+    background-clip: content-box;
+}
+.left > .buttondiv {
+    background-color: grey;
+}
+.right > .buttondiv {
+    background-color: gold;
+}
+button, input {
+    width: 10em;
+    box-sizing: border-box;
+}
+button {
+    /*
+    display: none;
+    */
+    height: 5em;
+}
+button:hover {
+    background-color: orange;
+}
+button:active {
+    background-color: red;
+}
+button > p {
+    line-height: 1.4em;
+    margin: 0px;
+}
+#canvas {
+    display: block;
+    position: fixed;
+    inset: 0px;
+    height: 100%;
+    width: 100%;
+    pointer-events: none;
+}
+.dot {
+    background-color: blue;
+    position: fixed;
+    width: 5px;
+    height: 5px;
+    z-index: 10000;
+    pointer-events: none;
+}
+</style>
+<script>
+    // Cursor location
+    var cursor_xy = [-1,-1];
+    // Cursor click information
+    var clicks_ms = [];
+    var avg_click_ms = 0;
+    var min_click_ms = -1;
+    var max_click_ms = -1;
+    var mouse0_down_ts = -1;
+    // Cursor traces
+    var trace = false;
+    // DOM elements
+    dot_el = null;
+    canvas_el = null;
+
+    function create_dot() {
+        var dot = document.createElement("div")
+        dot.className = "dot";
+        document.body.appendChild(dot);
+        dot_el = dot;
+    }
+    function move_dot(xy) {
+        dot_el.style.left = xy[0] - dot_el.offsetWidth/2 + "px";
+        dot_el.style.top = xy[1] - dot_el.offsetHeight/2 + "px";
+    }
+
+    // Return the distance between two 2d points.
+    function distance2d(xy1, xy2) {
+        d1 = xy1[0] - xy2[0];
+        d2 = xy1[1] - xy2[1];
+        return Math.sqrt(d1**2 + d2**2);
+    }
+    // Return a random HLS color.
+    function random_hsl() {
+        return ( "hsl("
+            + (Math.random()*360) + ", "
+            + (Math.random()*50 + 50) + "%, "
+            + (Math.random()*60 + 20) + "%)");
+    }
+    function init_canvas() {
+        canvas_el = document.querySelector("#canvas");
+        var settings =
+            { lineWidth: 4
+            , lineCap: "round"
+            , strokeStyle: random_hsl()
+            };
+        console.log(settings.strokeStyle);
+        set_ctx(settings);
+    }
+    function set_ctx(settings) {
+        ctx = canvas_el.getContext("2d");
+        Object.assign(ctx, settings);
+    }
+    function get_ctx(extra_keys=null) {
+        ctx = canvas_el.getContext("2d");
+        var ks = ["lineWidth", "lineCap", "strokeStyle"];
+        if (extra_keys != null)
+            ks = ks.concat(extra_keys);
+        return Object.fromEntries(ks.map(k => [k, ctx[k]]));
+    }
+    // Scale the canvas coordinates to match the canvas size.
+    function resize_canvas() {
+        var cvs1 = canvas_el;
+        var ctx1 = cvs1.getContext("2d")
+        var cvs2 = document.createElement("canvas");
+        var ctx2 = cvs2.getContext("2d");
+        cvs2.width = cvs1.width;
+        cvs2.height = cvs1.height;
+        ctx2.drawImage(cvs1, 0, 0);
+        var r = cvs1.getBoundingClientRect();
+        var s = get_ctx();
+        cvs1.width = r.width;
+        cvs1.height = r.height;
+        ctx1.drawImage
+            ( cvs2
+            , 0, 0, cvs2.width, cvs2.height
+            , 0, 0, cvs1.width, cvs1.height
+            );
+        set_ctx(s);
+    }
+    // Change the canvas context stroke style to a random HLS color.
+    function random_hsl_canvas() {
+        ctx = canvas_el.getContext("2d");
+        ctx.strokeStyle = random_hsl();
+    }
+    // Draw a line between the two 2d points.
+    function update_trace(xy_now, xy_pre, dmin=5) {
+        //if (distance2d(xy_now, xy_pre) < dmin) {
+        //        return;
+        //}
+        if (xy_pre[0] < 0 || xy_pre[1] < 0)
+            return;
+        var ctx = canvas_el.getContext("2d");
+        ctx.beginPath();
+        ctx.moveTo(xy_pre[0], xy_pre[1]);
+        ctx.lineTo(xy_now[0], xy_now[1]);
+        ctx.stroke();
+        ctx.closePath();
+    }
+    function toggle_trace() {
+        trace = !trace;
+    }
+    function clear_trace() {
+        ctx = canvas_el.getContext("2d");
+        ctx.clearRect(0, 0, canvas_el.width, canvas_el.height);
+    }
+
+    // Record the timestamp at which the main mouse button was pressed down.
+    function record_main_downclick(evt) {
+        if (evt.button != 0)
+            return;
+        mouse0_down_ts = evt.timeStamp;
+    }
+    // Record click statistics, if it actually is a click.
+    function record_main_upclick(evt) {
+        if (evt.button != 0 || mouse0_down_ts <= 0)
+            return;
+        round = (x) => Math.round(x*100) / 100;
+        var duration = evt.timeStamp - mouse0_down_ts;
+        avg_click_ms += (duration - avg_click_ms) / (clicks_ms.length + 1);
+        min_click_ms = min_click_ms <= 0 ?
+            duration : Math.min(min_click_ms, duration);
+        max_click_ms = max_click_ms <= 0 ?
+            duration : Math.max(max_click_ms, duration);
+        // Reset the mouse down-click to detect spurious up-clicks.
+        mouse0_down_ts = -1;
+        // Store the durations, such as for plotting the distribution.
+        clicks_ms.push(duration);
+        console.log("Click [current: (min, avg, max)]: "
+            + round(duration) + ": ("
+            + round(min_click_ms) + ", "
+            + round(avg_click_ms) + ", "
+            + round(max_click_ms) + ") ms");
+    }
+    // Log the current cursor position.
+    function check_cursor() {
+        console.log("Cursor location: ("
+            + cursor_xy[0] + ", "
+            + cursor_xy[1] + ")");
+    }
+
+    function mousedown_handler(evt) {
+        record_main_downclick(evt);
+        random_hsl_canvas();
+    }
+    function mouseup_handler(evt) {
+        record_main_upclick(evt);
+        random_hsl_canvas();
+    }
+    // Handle cursor updates, if the cursor moved.
+    function mousemove_handler(evt) {
+        xy = [evt.pageX, evt.pageY];
+        if (xy[0] == cursor_xy[0] && xy[1] == cursor_xy[1])
+            return;
+        move_dot(xy);
+        if (trace)
+            update_trace(xy, cursor_xy);
+        cursor_xy[0] = xy[0];
+        cursor_xy[1] = xy[1];
+    }
+    function button_toggle_handler(evt) {
+        if (evt.button != 0)
+            return;
+        toggle_trace();
+    }
+    function button_clear_handler(evt) {
+        if (evt.button != 0)
+            return;
+        clear_trace();
+        toggle_trace();
+    }
+    function keyup_handler(evt) {
+        if (evt.code == "KeyE") {
+            clear_trace();
+            toggle_trace();
+        } else if (evt.code == "KeyT") {
+            toggle_trace();
+        } else if (evt.code == "KeyR") {
+            random_hsl_canvas();
+        }
+    }
+    function register_handlers() {
+        button_clear = document.querySelector("#b_clear");
+        button_clear.addEventListener("click", button_clear_handler);
+        button_toggle = document.querySelector("#b_toggle");
+        button_toggle.addEventListener("click", button_toggle_handler);
+        document.addEventListener("mouseup", mouseup_handler);
+        document.addEventListener("mousedown", mousedown_handler);
+        document.addEventListener("mousemove", mousemove_handler);
+        window.addEventListener("resize", resize_canvas);
+        window.addEventListener("keyup", keyup_handler);
+        setInterval(check_cursor, 1000 * 0.5);
+    }
+    // Initialize state when document is loaded.
+    document.addEventListener("DOMContentLoaded", () => {
+        create_dot();
+        init_canvas();
+        resize_canvas();
+        register_handlers();
+    });
+</script>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+    <div class="container">
+        <div class="left"><div class="buttondiv">
+            <button type="button" id="b_clear">
+                <p>Toggle & Clear<br>&lt;E&gt;</p>
+            </button>
+                <input type="text" id="i1"></input>
+        </div></div>
+        <div class="right"><div class="buttondiv">
+                <button type="button" id="b_toggle">
+                    <p>Toggle<br>&lt;T&gt;</p>
+                </button>
+                <input type="text" id="i2"></input>
+        </div></div>
+    </div>
+</body>
+</html>

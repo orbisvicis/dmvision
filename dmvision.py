@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__ = "Yclept Nemo"
 __title__ = "DMVision"
 
 
+import wave
+import random
+import tempfile
 import math
 import struct
 import itertools
@@ -19,6 +22,7 @@ import inspect
 import os
 import os.path
 import sys
+import types
 import typing
 import enum
 import contextlib
@@ -26,6 +30,13 @@ import threading
 import queue
 import asyncio
 import concurrent.futures
+
+import bs4
+import numpy
+import scipy
+
+import vosk
+import ffmpeg
 
 import pyaudio
 import aiohttp_basicauth
@@ -38,6 +49,8 @@ import twilio.rest
 import dateutil.parser
 import selenium.webdriver
 
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.keys import Keys as WebDriverKeys
 from selenium.webdriver.support.ui import Select
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException
@@ -65,6 +78,9 @@ class AppointmentInfo:
 
     # Determines if an appointment should be scheduled
     check_calendar: typing.Callable[..., bool]
+
+    # Required only for the road test and so optional
+    permit_validation: str = ""
 
 
 @dataclasses.dataclass
@@ -96,6 +112,17 @@ class SeleniumInfo:
         if self.geckodriver_path:
             args["executable_path"] = self.geckodriver_path
         return selenium.webdriver.Firefox(**args)
+
+
+@dataclasses.dataclass
+class VoskInfo:
+    model_path: str
+    log_level: int = -1
+
+    # Loading the model takes time, so do it immediately rather than lazily.
+    def __post_init__(self):
+        vosk.SetLogLevel(self.log_level)
+        self.model = vosk.Model(self.model_path)
 
 
 @dataclasses.dataclass
@@ -588,6 +615,293 @@ class Sound(threading.Thread):
             t += 1
 
 
+# Sleep (at least) until the given seconds since the marked time have passed,
+# or since the current time without a mark. Unlike sleep, negative time is
+# ignored and zero time does not sleep. By default the current time is marked
+# during object initialization.
+class MarkSleeper:
+    def __init__(self, mark=True):
+        if mark:
+            self.mark()
+        else:
+            self.clear()
+
+    def mark(self):
+        self.since = time.monotonic()
+
+    def clear(self):
+        self.since = None
+
+    def sleep(self, secs):
+        since = self.since
+        if since:
+            secs = self.since + secs - time.monotonic()
+        if secs > 0:
+            time.sleep(secs)
+        self.mark()
+        return secs
+
+
+class DecaptchaError(Exception):
+    pass
+
+
+class DecaptchaDOSError(DecaptchaError):
+    """ recaptcha's service denial: "try again later"
+    """
+
+
+class DecaptchaFailError(DecaptchaError):
+    """ decaptcha has exhausted all attempts and failed. An optional error.
+    """
+
+
+def decaptcha(selenium_info, vosk_info, timeout=1, attempts=5, error=False):
+    driver = selenium_info.driver
+    # It is not possible to save a reference to the current frame that remains
+    # valid in other frames. Given the nested frames [a -> b -> c], frame 'c'
+    # is only valid from frame 'b' and not from frames 'a' or 'c'. It follows
+    # there can be no reference to the top-level frame, which can only be
+    # focused via a selenium function. Decaptcha needs access to the top-level
+    # frame and guarantees that on exit, that frame will remain active.
+    try:
+        r = decaptcha_solve(selenium_info, vosk_info, timeout, attempts)
+        if error and not r:
+            raise DecaptchaFailError
+        return r
+    except WebDriverException as e:
+        # Any exception caused by ReCAPTCHA blocking further interactions will
+        # be raised when focus is switched to the popup frame. There is no need
+        # to switch to any other frames.
+        if decaptcha_blocked(driver):
+            raise DecaptchaDOSError from e
+        raise
+    finally:
+        # Unless an exception was raised the top-level frame should already be
+        # focused. For simplicity and as a safeguard against future
+        # modifications, switch to the top-level frame regardless.
+        driver.switch_to.default_content()
+
+def decaptcha_blocked(driver):
+    # Determine if ReCAPTCHA is blocking further interaction.
+    els = driver.find_elements_by_css_selector("[class*='doscaptcha'i]")
+    return bool(els)
+
+def decaptcha_checked(e_check, timeout, frequency=None):
+    # Determine if the element is checked (if the captcha passed).
+    if not frequency:
+        frequency = timeout / 10
+    try:
+        WebDriverWait(e_check.parent, timeout, frequency).until\
+            (lambda d:
+                "recaptcha-checkbox-checked" in
+                e_check.get_attribute("class").split())
+    except TimeoutException:
+        return False
+    else:
+        return True
+
+# Run this javascript to log the times needed to emulate human input:
+#   cel = document.createElement("div");
+#   document.body.appendChild(cel);
+#   cel.id = "click-logger";
+#   cel.style.position = "fixed";
+#   cel.style.inset = "0px";
+#   cel.style.height = "100%";
+#   cel.style.width = "100%";
+#   cel.style.zIndex = 10000000000;
+#   cel.style.pointerEvents = "auto";
+#   cel.addEventListener("click", (evt) => {
+#       cel.style.pointerEvents = "none";
+#       console.log(evt.timeStamp/1000);
+#       setTimeout(() => {
+#           cel.style.pointerEvents = "auto";
+#       }, 1000*0.75);
+#   });
+#
+# The double-click behavior is a hack to work around the cross-origin policy.
+def decaptcha_solve(selenium_info, vosk_info, timeout, attempts):
+    # Solve the ReCAPTCHA. This is the function responsible for program flow
+    # and so manages the frame focus. All subroutines expect the correct frame
+    # to be in focus before executing.
+    driver = selenium_info.driver
+    msleep = MarkSleeper()
+
+    # Selenium by default waits for document.readyState to be "complete", ie
+    # for the window.load event. The reCAPTCHA v2 widget, when automatically
+    # rendered, will have created both its iframes before this so there is no
+    # need for Selenium to wait further.
+    #
+    # I'm not sure if the iframes' documents are guaranteed to have loaded
+    # before Selenium is ready and so use an explicit wait to play it safe.
+    #
+    # If an in-progress captcha times out neither iframe is reloaded, ensuring
+    # that settings such as the audio/image toggle are preserved between runs.
+    # If a successful captcha times out both iframes are reloaded, causing
+    # settings such as the audio/image toggle to be forgotten.
+    driver.switch_to.default_content()
+
+    i_entry = driver.find_element_by_css_selector(".g-recaptcha iframe")
+    i_realm = driver.find_elements_by_css_selector\
+        ("body > div > div > iframe[title*='recaptcha'i]")[-1]
+
+    driver.switch_to.frame(i_entry)
+
+    e_check = WebDriverWait(driver, timeout).until\
+        (lambda d: d.find_element_by_id("recaptcha-anchor"))
+
+    # Click the checkbox.
+    msleep.mark()
+    decaptcha_sample_click(e_check)
+
+    # Check that the checkbox is clicked.
+    if decaptcha_checked(e_check, timeout):
+        return True
+
+    driver.switch_to.default_content()
+    driver.switch_to.frame(i_realm)
+
+    # Switch to an audio captcha. The error message from a blocked captcha here
+    # will obscure the audio button. Clicking the audio button will raise an
+    # 'ElementClickInterceptedException' error.
+    #
+    # Possible states of the audio button:
+    # Visible but covered by the blocked-captcha message:
+    #   is_displayed -> True
+    #   click -> ElementClickInterceptedException
+    # Visible with image captcha active:
+    #   is_displayed -> True
+    #   click -> success
+    # Invisible with audio captcha active:
+    #   is_displayed -> False
+    #   click -> ElementNotInteractableException
+    #
+    # We should never be in a state having the audio captcha as the default
+    # interface.
+    el = WebDriverWait(driver, timeout).until\
+        (lambda d: d.find_element_by_id("recaptcha-audio-button"))
+    msleep.sleep(0.875)
+    decaptcha_sample_click(el)
+
+    while True:
+        # The elements here are recreated every loop and so must be found again
+        # to avoid a 'StaleElementReferenceException' error.
+        attempts -= 1
+        # Play the audio; only the click is synchronous. A blocked captcha here
+        # will show an error message rather than the expected dialog and so the
+        # click will raise a 'NoSuchElementException' error.
+        el = WebDriverWait(driver, timeout).until\
+            (lambda d: d.find_element_by_css_selector
+                (".rc-audiochallenge-play-button > button"))
+        msleep.sleep(0.75)
+        decaptcha_sample_click(el)
+
+        # Get the audio download link.
+        el = WebDriverWait(driver, timeout).until\
+            (lambda d: d.find_element_by_class_name
+                ("rc-audiochallenge-tdownload-link"))
+        url = el.get_attribute("href")
+
+        # Run speech recognition from a temporary directory.
+        vosk_sr_m = lambda f: vosk_sr(f, vosk_info.model)
+        with tempfile.TemporaryDirectory() as dirpath:
+            txt = vosk_sr_m(vosk_convert(decaptcha_download(dirpath, url)))
+
+        # Input the audio response text.
+        el = WebDriverWait(driver, timeout).until\
+            (lambda d: d.find_element_by_id("audio-response"))
+        msleep.sleep(2.0)
+        decaptcha_sample_click(el)
+        el.send_keys(txt + WebDriverKeys.ENTER)
+
+        driver.switch_to.default_content()
+        driver.switch_to.frame(i_entry)
+
+        # Check that the checkbox is clicked.
+        if decaptcha_checked(e_check, timeout):
+            return True
+
+        if attempts <= 0:
+            return False
+
+        driver.switch_to.default_content()
+        driver.switch_to.frame(i_realm)
+
+def decaptcha_sample_click(el):
+    # Click the element in a more natural fashion. Click duration is given by a
+    # beta distribution with negative skew. Click position is given by
+    # symmetric beta distribution - see 'decaptcha_sample_center'.
+    s = decaptcha_sample_center(el)
+    # based on data collected using 'automation.aid.html'
+    d = random.betavariate(6, 14)*250 + 50
+    ( ActionChains(el.parent)
+    . move_to_element_with_offset(el, *s)
+    . click_and_hold()
+    . pause(d/1000)
+    . release()
+    . perform()
+    )
+
+def decaptcha_sample_center(el):
+    # Sample a coordinate within the element's context box - excluding a small
+    # margin - using a symmetric beta distribution. The margin is specified by
+    # the element's font size and horizontal width, whichever is smaller.
+    #
+    # get element font size
+    f = el.value_of_css_property("font-size")
+    r = re.search(r"-?\d+(\.\d+)?", f)
+    if r is None:
+        raise ValueError(f"Cannot parse '{f}' as float")
+    f = float(r.group())
+    # element dimensions
+    d = (el.size["width"], el.size["height"])
+    # margins for the sample area
+    m = tuple(min(f, x/10) for x in d)
+    # sample area
+    a = tuple(x - 2*y for x,y in zip(d,m))
+    # sample a symmetric beta distribution
+    s = tuple(random.betavariate(5,5) for _ in a)
+    # scale and shift the sample into the area
+    s = tuple(x*y+z for x,y,z in zip(s,a,m))
+    return s
+
+def decaptcha_download(dirpath, url):
+    # Download a captcha to the given directory. The calling function is
+    # responsible for cleanup.
+    with requests.get(url, stream=True) as r:
+        r.raise_for_status()
+        filepath = os.path.join(dirpath, "audio.captcha.mp3")
+        with open(filepath, "wb") as f:
+            for c in r.iter_content(1024<<4):
+                f.write(c)
+    return filepath
+
+def vosk_convert(filepath):
+    # Convert the given file to a format suitable for vosk.
+    filepath_out = os.path.splitext(filepath)[0] + ".wav"
+    _ = ( ffmpeg.input(filepath)
+        . output(filepath_out, acodec="pcm_s16le", ac=1, ar="16k")
+        . overwrite_output()
+        . run(quiet=True)
+        )
+    return filepath_out
+
+def vosk_sr(file, model):
+    # Run speech recognition using vosk.
+    with wave.open(file) as w:
+        assert ( w.getnchannels() == 1
+             and w.getsampwidth() == 2
+             and w.getcomptype() == "NONE"
+             and w.getframerate() == 16000)
+        r = vosk.KaldiRecognizer(model, w.getframerate())
+        while True:
+            d = w.readframes(8000)
+            if not d:
+                break
+            r.AcceptWaveform(d)
+        t = r.FinalResult()
+        return json.loads(t)["text"]
+
 # In case of a given set of exceptions, retry the decorated function with the
 # given timeouts. If timeouts are exhausted, re-raise the exception. If the
 # reset period is met, reset the timeouts from the beginning. Return the result
@@ -1043,7 +1357,8 @@ def run_asyncio(thread_info, coro):
 # wrap it in a retry function. This is the main entry point of the program.
 def run\
     ( ids, id_type, ids_names
-    , appt_info, twilio_info, selenium_info, server_info, other_info
+    , appt_info, twilio_info, selenium_info
+    , vosk_info, server_info, other_info
     , notification_manager
     ):
     sound = Sound()
@@ -1100,8 +1415,8 @@ def run\
                 restart_monitor\
                     ( id_type, ids_names
                     , appt_info, twilio_info, thread_info
-                    , selenium_info, other_info, sound
-                    , notification_manager
+                    , selenium_info, vosk_info, other_info
+                    , sound, notification_manager
                     )
             except WebDriverException:
                 selenium_info.driver.save_screenshot\
@@ -1136,11 +1451,9 @@ def run\
 def monitor\
     ( id_type, ids_names
     , appt_info, twilio_info, thread_info
-    , selenium_info, other_info, sound
-    , notification_manager
+    , selenium_info, vosk_info, other_info
+    , sound, notification_manager
     ):
-    url_base = "https://telegov.njportal.com"
-    url_date = url_base + "/njmvc/CustomerCreateAppointments/GetNextAvailableDate"
     # No lock necessary as 'id_state' is only modified by this thread and
     # read/read is thread-safe.
     state = thread_info.id_state
@@ -1173,25 +1486,8 @@ def monitor\
             else:
                 f(id_type=id_type, id_state=state)
         # Run the requests to generate the new state.
-        changes = 0
-        state_new = state.copy()
-        for i,s in state.items():
-            d = {"appointmentTypeId": id_type, "locationId": i}
-            r = requests.post(url_date, d, headers={"Referer": url_base})
-            if r.status_code != requests.codes.ok:
-                m = "Error: unable to update availibility for '{}'"
-                m = m.format(ids_names[i])
-                logger(m, file=sys.stderr)
-                continue
-            r = json.loads(r.text)
-            n = get_availability(r["next"])
-            if not n[0] and r["next"] != "No Appointments Available":
-                m = "Error: unknown response, assuming no availability for '{}'"
-                m = m.format(ids_names[i])
-                logger(m, file=sys.stderr)
-            if n != s:
-                changes += 1
-                state_new[i] = n
+        changes, state_new = get_availabilities\
+            (id_type, ids_names, state, logger)
         # Dispatch decisions based on the new state. As cross-thread state is
         # involved, acquire the coarse lock.
         with async_acquire(thread_info.appt_lock, thread_info.loop):
@@ -1212,7 +1508,7 @@ def monitor\
                 thread_info.appt, thread_info.sched_avail, sched_errors =\
                     schedule\
                     ( id_type, state_new
-                    , appt_info, selenium_info
+                    , appt_info, selenium_info, vosk_info
                     , thread_info.appt_blocklist
                     )
             else:
@@ -1269,7 +1565,7 @@ def format_sched_message_print\
             , f" ({sched_tries+1}/{sched_max})" if appt is None else ""
             )
         ]
-    m.extend(f(i[0]) + "Error scheduling" for i in sched_errors)
+    m.extend(f(i[0]) + "Error scheduling: " + i[2] for i in sched_errors)
     if appt is not None:
         m.append\
             ( f(appt[0])
@@ -1294,7 +1590,7 @@ def format_sched_message_sms\
             )
         ]
     m.extend\
-        ( "\n{}\n{}".format(ids_names[i[0]], "Error scheduling")
+        ( "\n{}\n{}: {}".format(ids_names[i[0]], "Error scheduling", i[2])
           for i in sched_errors
         )
     if appt is not None:
@@ -1438,7 +1734,11 @@ def get_status(confirmation):
 
 # For each location with a valid appointment, attempt to schedule that
 # appointment. Stop when an appointment has been confirmed as scheduled.
-def schedule(id_type, loc_id_state, appt_info, selenium_info, blocklist):
+def schedule\
+    ( id_type, loc_id_state
+    , appt_info, selenium_info, vosk_info
+    , blocklist
+    ):
     # If an appointment matched but couldn't be taken, append it to 'errors'.
     # If 'appt' is None, either there were no matches, or every match was an
     # error.
@@ -1448,6 +1748,12 @@ def schedule(id_type, loc_id_state, appt_info, selenium_info, blocklist):
 
     url_base = "https://telegov.njportal.com"
     url_appt = url_base + "/njmvc/AppointmentWizard/{tid}/{lid}/{d}/{t}"
+
+    err_msgs =\
+        { DecaptchaDOSError: "CAPTCHA Blocked"
+        , DecaptchaFailError: "CAPTCHA Failed"
+        , TimeoutException: "Timeout"
+        }
 
     for loc_id,s in loc_id_state.items():
         if not s[0]:
@@ -1467,13 +1773,18 @@ def schedule(id_type, loc_id_state, appt_info, selenium_info, blocklist):
             )
         selenium_info.driver.get(u)
         if selenium_info.driver.current_url != u:
-            errors.append((loc_id, s[2]))
+            errors.append((loc_id, s[2], "Mismatched URLs"))
             continue
 
-        confirmation = selenium_info.autofill(appt_info, selenium_info)
+        try:
+            confirmation = selenium_info.autofill\
+                (appt_info, selenium_info, vosk_info)
+        except tuple(err_msgs) as e:
+            errors.append((loc_id, s[2], err_msgs[type(e)]))
+            continue
 
         if not confirmation:
-            errors.append((loc_id, s[2]))
+            errors.append((loc_id, s[2], "No confirmation"))
             continue
 
         # (location id, datetime, confirmation)
@@ -1493,37 +1804,7 @@ def datetime_within(dt, d_t0, d_t1):
         return False
     return True
 
-def permit_autofill(appt_info, selenium_info, timeout=5):
-    driver = selenium_info.driver
-
-    driver.find_element_by_id("firstName")\
-        .send_keys(appt_info.first_name)
-    driver.find_element_by_id("lastName")\
-        .send_keys(appt_info.last_name)
-    driver.find_element_by_id("email")\
-        .send_keys(appt_info.email)
-    driver.find_element_by_id("phone")\
-        .send_keys(appt_info.phone)
-    driver.find_element_by_id("birthDate")\
-        .send_keys(appt_info.birth_date)
-    driver.find_element_by_name("Attest")\
-        .click()
-
-    Select(driver.find_element_by_id("permitType"))\
-        .select_by_value("Class D")
-
-    driver.find_element_by_css_selector("input.btn[value='submit'i]")\
-        .click()
-
-    try:
-        el = WebDriverWait(driver, timeout).until\
-            (lambda d: d.find_element_by_css_selector("#divReview span"))
-    except TimeoutException:
-        return None
-
-    return el.text
-
-def knowledge_autofill(appt_info, selenium_info, timeout=5):
+def road_autofill(appt_info, selenium_info, vosk_info, timeout=5):
     driver = selenium_info.driver
 
     driver.find_element_by_id("firstName")\
@@ -1536,22 +1817,171 @@ def knowledge_autofill(appt_info, selenium_info, timeout=5):
         .send_keys(appt_info.phone)
     driver.find_element_by_id("driverLicense")\
         .send_keys(appt_info.driver_license)
-    driver.find_element_by_name("Attest")\
-        .click()
+    driver.find_element_by_id("validationNum")\
+        .send_keys(appt_info.permit_validation)
 
-    Select(driver.find_element_by_id("test"))\
-        .select_by_value("Auto")
+    driver.find_element_by_css_selector\
+        ("input[name='Attest'][type='checkbox']").click()
+    driver.find_element_by_css_selector\
+        ("input[name='PtaAttest'][type='checkbox']").click()
+
+    Select(driver.find_element_by_id("permitClass"))\
+        .select_by_value("D")
 
     driver.find_element_by_css_selector("input.btn[value='submit'i]")\
         .click()
 
-    try:
-        el = WebDriverWait(driver, timeout).until\
-            (lambda d: d.find_element_by_css_selector("#divReview span"))
-    except TimeoutException:
-        return None
+    # The road test form is protected by reCAPTCHA v2 Invisible, which must be
+    # handled after the form is submitted, but also which has yet to become an
+    # issue.
+
+    # TimeoutException is handled in the parent.
+    el = WebDriverWait(driver, timeout).until\
+        (lambda d: d.find_element_by_css_selector("#divReview span"))
+
+    # Though not documented, this appears to first strip the text.
+    return el.text
+
+def permit_autofill(appt_info, selenium_info, vosk_info, timeout=5):
+    driver = selenium_info.driver
+
+    driver.find_element_by_id("firstName")\
+        .send_keys(appt_info.first_name)
+    driver.find_element_by_id("lastName")\
+        .send_keys(appt_info.last_name)
+    driver.find_element_by_id("email")\
+        .send_keys(appt_info.email)
+    driver.find_element_by_id("phone")\
+        .send_keys(appt_info.phone)
+    driver.find_element_by_id("birthDate")\
+        .send_keys(appt_info.birth_date)
+
+    driver.find_element_by_css_selector\
+        ("input[name='Attest'][type='checkbox']").click()
+    driver.find_element_by_css_selector\
+        ("input[name='PtaAttest'][type='checkbox']").click()
+
+    Select(driver.find_element_by_id("permitType"))\
+        .select_by_value("Class D")
+
+    # Decaptcha errors are handled in the parent.
+    decaptcha(selenium_info, vosk_info, error=True)
+
+    driver.find_element_by_css_selector("input.btn[value='submit'i]")\
+        .click()
+
+    # TimeoutException is handled in the parent.
+    el = WebDriverWait(driver, timeout).until\
+        (lambda d: d.find_element_by_css_selector("#divReview span"))
 
     return el.text
+
+def knowledge_autofill(appt_info, selenium_info, vosk_info, timeout=5):
+    driver = selenium_info.driver
+
+    driver.find_element_by_id("firstName")\
+        .send_keys(appt_info.first_name)
+    driver.find_element_by_id("lastName")\
+        .send_keys(appt_info.last_name)
+    driver.find_element_by_id("email")\
+        .send_keys(appt_info.email)
+    driver.find_element_by_id("phone")\
+        .send_keys(appt_info.phone)
+    driver.find_element_by_id("driverLicense")\
+        .send_keys(appt_info.driver_license)
+
+    driver.find_element_by_css_selector\
+        ("input[name='Attest'][type='checkbox']").click()
+    driver.find_element_by_css_selector\
+        ("input[name='PtaAttest'][type='checkbox']").click()
+
+    Select(driver.find_element_by_id("test"))\
+        .select_by_value("Auto")
+
+    # Decaptcha errors are handled in the parent.
+    decaptcha(selenium_info, vosk_info, error=True)
+
+    driver.find_element_by_css_selector("input.btn[value='submit'i]")\
+        .click()
+
+    # TimeoutException is handled in the parent.
+    el = WebDriverWait(driver, timeout).until\
+        (lambda d: d.find_element_by_css_selector("#divReview span"))
+
+    return el.text
+
+# Copy the state, and for each location update the appointment availability but
+# only if there have been changes. First request the complete dataset from the
+# frontend, then for each missing location fill in the availability data using
+# a backend endpoint. Return the new state and the number of updates.
+def get_availabilities(id_type, ids_names, id_state, logger):
+    url_base = "https://telegov.njportal.com"
+    url_appt = f"{url_base}/njmvc/AppointmentWizard/{id_type}"
+    url_date = f"{url_base}/njmvc/CustomerCreateAppointments/GetNextAvailableDate"
+
+    unavailable = "No Appointments Available"
+    avail_ids = {}
+    avail_all = {}
+    headers = {"Referer": url_base}
+
+    # Get the complete availability dataset and check for missing locations.
+    r = requests.get(url_appt, headers=headers)
+    if r.status_code != requests.codes.ok:
+        m = "Error: unable to request collected availability"
+        logger(m, file=sys.stderr)
+    else:
+        avail_all = json.loads(r.text)
+        if len(avail_all) != len(ids_names):
+            m = "Warning: collected availability contains {} of {} locations"
+            m = m.format(len(avail_all), len(ids_names))
+            logger(m, file=sys.stderr)
+        avail_all = {i["LocationId"]:i["FirstOpenSlot"] for i in r}
+
+    # Get the relevant locations from the complete dataset, skipping any
+    # unknown responses.
+    for i in id_state.keys():
+        if i not in avail_all:
+            continue
+        r = avail_all[i]
+        n = get_availability(r)
+        if not n[0] and r != unavailable:
+            m = "Error: unknown response, skipping '{}' from collection"
+            m = m.format(ids_names[i])
+            logger(m, file=sys.stderr)
+            continue
+        avail_ids[i] = n
+
+    # Get the data for each missing location, if possible. Skip locations on
+    # network errors. Interpret unknown responses as lack of availability.
+    for i in id_state.keys():
+        if i in avail_ids:
+            continue
+        d = {"appointmentTypeId": id_type, "locationId": i}
+        r = requests.post(url_date, d, headers=headers)
+        if r.status_code != requests.codes.ok:
+            m = "Error: unable to update availability for '{}'"
+            m = m.format(ids_names[i])
+            logger(m, file=sys.stderr)
+            continue
+        r = json.loads(r.text)["next"]
+        n = get_availability(r)
+        if not n[0] and r != unavailable:
+            m = "Error: unknown response, assuming no availability for '{}'"
+            m = m.format(ids_names[i])
+            logger(m, file=sys.stderr)
+        avail_ids[i] = n
+
+    # Copy the state and update locations with differing appointment data. At
+    # this point, 'avail_ids' is a subset of 'state' ie when network conditions
+    # cause locations to be skipped.
+    state_new = id_state.copy()
+    changes = 0
+    for i,n in avail_ids.items():
+        if state_new[i] != n:
+            changes += 1
+            state_new[i] = n
+
+    return changes, state_new
 
 # An example response:
 # { "next":
@@ -1820,126 +2250,114 @@ def notify_sound(sound):
     sound.replace(notes)
 
 
-# Initial Permit (Before Knowledge Test)
-# https://telegov.njportal.com/njmvc/AppointmentWizard/15
-#
-# {d["Id"]:d["Name"] for d in permitLocationData}
-permit_id_type = 15
-permit_locations =\
-    { 186: 'Bakers Basin - Permits/License'
-    , 187: 'Bayonne - Permits/License'
-    , 189: 'Camden - Permits/License'
-    , 208: 'Cardiff - Permits/License'
-    , 191: 'Delanco - Permits/License'
-    , 192: 'Eatontown - Permits/License'
-    , 194: 'Edison - Permits/License'
-    , 195: 'Flemington - Permits/License'
-    , 197: 'Freehold - Permits/License'
-    , 198: 'Lodi - Permits/License'
-    , 200: 'Newark - Permits/License'
-    , 201: 'North Bergen - Permits/License'
-    , 203: 'Oakland - Permits/License'
-    , 204: 'Paterson - Permits/License'
-    , 206: 'Rahway - Permits/License'
-    , 207: 'Randolph - Permits/License'
-    , 188: 'Rio Grande - Permits/License'
-    , 190: 'Salem - Permits/License'
-    , 193: 'South Plainfield - Permits/License'
-    , 196: 'Toms River - Permits/License'
-    , 199: 'Vineland - Permits/License'
-    , 202: 'Wayne - Permits/License'
-    , 205: 'West Deptford - Permits/License'
-    }
+def appt_data(update_globals=False, globals_conflict=True):
+    url_base = "https://telegov.njportal.com"
+    url_appt = url_base + "/njmvc/AppointmentWizard"
 
-# Knowledge testing:
-# https://telegov.njportal.com/njmvc/AppointmentWizard/17
-#
-# {d["Id"]:d["Name"] for d in knowledgeLocationData}
-knowledge_id_type = 17
-knowledge_locations =\
-    { 232: 'Bakers Basin - Knowledge Test'
-    , 233: 'Bayonne - Knowledge Test'
-    , 235: 'Camden - Knowledge Test'
-    , 254: 'Cardiff - Knowledge Test'
-    , 237: 'Delanco - Knowledge Test'
-    , 238: 'Eatontown - Knowledge Test'
-    , 240: 'Edison - Knowledge Test'
-    , 241: 'Flemington - Knowledge Test'
-    , 243: 'Freehold - Knowledge Test'
-    , 244: 'Lodi - Knowledge Test'
-    , 246: 'Newark - Knowledge Test'
-    , 247: 'North Bergen - Knowledge Test'
-    , 249: 'Oakland - Knowledge Test'
-    , 250: 'Paterson - Knowledge Test'
-    , 252: 'Rahway - Knowledge Test'
-    , 253: 'Randolph - Knowledge Test'
-    , 234: 'Rio Grande - Knowledge Test'
-    , 236: 'Salem - Knowledge Test'
-    , 239: 'South Plainfield - Knowledge Test'
-    , 242: 'Toms River - Knowledge Test'
-    , 245: 'Vineland - Knowledge Test'
-    , 248: 'Wayne - Knowledge Test'
-    , 251: 'West Deptford - Knowledge Test'
-    }
+    atype_names =\
+        [ ['renew', 'registration', 'mobile']
+        , ['renew', 'registration']
+        , ['renew', 'cdl']
+        , ['renew']
+        , ['title', 'registration', 'replace']
+        , ['title', 'registration']
+        , ['road', 'agricultural']
+        , ['road', 'motorcycle']
+        , ['road', 'moped']
+        , ['road', 'cdl']
+        , ['road']
+        , ['permit', 'mobile']
+        , ['permit', 'cdl']
+        , ['permit']
+        , ['knowledge', 'cdl']
+        , ['knowledge']
+        , ['nondriverid']
+        , ['realid', 'mobile']
+        , ['realid']
+        , ['transfer']
+        ]
 
-# CDL Permit or Endorsement - (Not For Knowledge Test)
-# https://telegov.njportal.com/njmvc/AppointmentWizard/14
-#
-# {d["Id"]:d["Name"] for d in cdlLocationData}
-cdl_id_type = 14
-cdl_locations =\
-    { 163: 'Bakers Basin - CDL Permits'
-    , 164: 'Bayonne - CDL Permits'
-    , 166: 'Camden - CDL Permits'
-    , 185: 'Cardiff - CDL Permits'
-    , 168: 'Delanco - CDL Permits'
-    , 169: 'Eatontown - CDL Permits'
-    , 171: 'Edison - CDL Permits'
-    , 172: 'Flemington - CDL Permits'
-    , 174: 'Freehold - CDL Permits'
-    , 175: 'Lodi - CDL Permits'
-    , 177: 'Newark - CDL Permits'
-    , 178: 'North Bergen - CDL Permits'
-    , 180: 'Oakland - CDL Permits'
-    , 181: 'Paterson - CDL Permits'
-    , 183: 'Rahway - CDL Permits'
-    , 184: 'Randolph - CDL Permits'
-    , 165: 'Rio Grande - CDL Permits'
-    , 167: 'Salem - CDL Permits'
-    , 170: 'South Plainfield - CDL Permits'
-    , 173: 'Toms River - CDL Permits'
-    , 176: 'Vineland - CDL Permits'
-    , 179: 'Wayne - CDL Permits'
-    , 182: 'West Deptford - CDL Permits'
-    }
+    assert len(set("_".join(l) for l in atype_names)) == len(atype_names)
 
-# Non-Driver ID:
-# https://telegov.njportal.com/njmvc/AppointmentWizard/16
-#
-# {d["Id"]:d["Name"] for d in ndidLocationData}
-nondriverid_id_type = 16
-nondriverid_locations =\
-    { 209: 'Bakers Basin - Non-Driver ID'
-    , 210: 'Bayonne - Non-Driver ID'
-    , 212: 'Camden - Non-Driver ID'
-    , 231: 'Cardiff - Non-Driver ID'
-    , 214: 'Delanco - Non-Driver ID'
-    , 215: 'Eatontown - Non-Driver ID'
-    , 217: 'Edison - Non-Driver ID'
-    , 218: 'Flemington - Non-Driver ID'
-    , 220: 'Freehold - Non-Driver ID'
-    , 221: 'Lodi - Non-Driver ID'
-    , 223: 'Newark - Non-Driver ID'
-    , 224: 'North Bergen - Non-Driver ID'
-    , 226: 'Oakland - Non-Driver ID'
-    , 227: 'Paterson - Non-Driver ID'
-    , 229: 'Rahway - Non-Driver ID'
-    , 230: 'Randolph - Non-Driver ID'
-    , 211: 'Rio Grande - Non-Driver ID'
-    , 213: 'Salem - Non-Driver ID'
-    , 216: 'South Plainfield - Non-Driver ID'
-    , 219: 'Toms River - Non-Driver ID'
-    , 222: 'Vineland - Non-Driver ID'
-    , 225: 'Wayne - Non-Driver ID'
-    , 228: 'West Deptford - Non-Driver ID'
-    }
+    atypes = []
+    anames = {}
+    seen_ids = set()
+    seen_names = set()
+
+    response = requests.get(url_appt, headers={"Referer": url_base})
+    response.raise_for_status()
+    soup = bs4.BeautifulSoup(response.text, "html.parser")
+    tags = soup.select\
+        ("#step-1 div[data-type][class~='cards'] > a[class*='button' i]")
+
+    for tag in tags:
+        url = tag["href"]
+        tid = int(re.search(r"/(\d+)$", url).group(1))
+        txt = tag.select_one("span[class*='title' i]").string.strip()
+        try:
+            txt = txt[:txt.index("(")]
+        except ValueError:
+            pass
+        txt = ( txt.lower()
+              . replace(" id", "id")
+              . replace("renewal", "renew")
+              . replace("replacement", "replace")
+              )
+        txt = "".join(c for c in txt if c.isalpha() or c.isspace())
+        txt = txt.strip()
+        if tid in seen_ids:
+            continue
+        if txt in seen_names:
+            m = f"Duplicate appointment-type name: '{txt}'"
+            raise ValueError(m)
+        atypes.append(types.SimpleNamespace(id=tid, name_source=txt))
+        seen_ids.add(tid)
+        seen_names.add(txt)
+
+    if len(atypes) != len(atype_names):
+        m = "Unexpected number of appointment types"
+        raise ValueError(m)
+
+    cost = numpy.zeros((len(atype_names), len(atypes)))
+
+    for atype in atypes:
+        url = url_appt + "/" + str(atype.id)
+        response = requests.get(url, headers={"Referer": url_base})
+        response.raise_for_status()
+        locations = json.loads\
+            ( re.search(r"var\s+locationData\s*=\s*(\[.*\])", response.text)
+            . group(1)
+            )
+        locations =\
+            { l["Id"]:l["Name"]
+              for l in sorted(locations, key=lambda l: l["Id"])}
+        atype.locations = locations
+
+    for i,atype in enumerate(atypes):
+        for j,name in enumerate(atype_names):
+            c = set(atype.name_source.split()) & set(name)
+            cost[j,i] = len(c)
+
+    result = scipy.optimize.linear_sum_assignment(cost, maximize=True)
+
+    for r,c in zip(*result):
+        atypes[c].name = "_".join(atype_names[r])
+
+    for atype in atypes:
+        anames[atype.name + "_id_type"] = atype.id
+        anames[atype.name + "_locations"] = atype.locations
+
+    g = globals()
+
+    if update_globals and globals_conflict:
+        for n in anames:
+            if n in g:
+                m = f"Globals unmodified, conflict on: '{n}'"
+                raise ValueError(m)
+
+    if update_globals:
+        g.update(anames)
+
+    return (atypes, anames)
+
+appt_data(update_globals=True)

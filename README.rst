@@ -63,6 +63,12 @@ server.
         , geckodriver_path = "/path/to/geckodriver"
         )
 
+    # Provide the path to the Vosk model. The Vosk speech
+    # recognition toolkit is used to solve Google reCAPTCHAs.
+    vosk_info = dmvision.VoskInfo\
+        ( model_path = "/path/to/vosk/model"
+        )
+
     # Configure the service as required though the
     # defaults should suffice and have been omitted.
     other_info = dmvision.OtherInfo()
@@ -100,7 +106,7 @@ server.
         ( selected_ids["knowledge"]
         , dmvision.knowledge_id_type
         , dmvision.knowledge_locations
-        , appt_info, twilio_info, selenium_info, server_info, other_info
+        , appt_info, twilio_info, selenium_info, vosk_info, server_info, other_info
         , notification_manager
         )
 
@@ -131,10 +137,15 @@ Requirements
 * module: `dateutil` (`@PyPI`__)
 * module: `requests` (`@PyPI`__)
 * module: `selenium` (`@PyPI`__)
-* module: `aiohttp_basicauth` (`@PyPI`__)
+* module: `aiohttp-basicauth` (`@PyPI`__)
 * module: `aiohttp` (`@PyPI`__)
 * module: `pyaudio` (`@PyPI`__)
 * module: `twilio` (`@PyPI`__)
+* module: `beautifulsoup4` (`@PyPI`__)
+* module: `numpy` (`@PyPI`__)
+* module: `scipy` (`@PyPI`__)
+* module: `vosk` (`@PyPI`__)
+* module: `ffmpeg-python` (`@PyPI`__)
 
 __ dateutil_PyPI_
 __ requests_PyPI_
@@ -143,6 +154,11 @@ __ aiohttp_basicauth_PyPI_
 __ aiohttp_PyPI_
 __ pyaudio_PyPI_
 __ twilio_PyPI_
+__ beautifulsoup4_PyPI_
+__ numpy_PyPI_
+__ scipy_PyPI_
+__ vosk_PyPI_
+__ ffmpeg_python_PyPI_
 
 Author
 ======
@@ -171,6 +187,11 @@ __ DMVision_PyPI_
 .. _aiohttp_PyPI:           https://pypi.org/project/aiohttp/
 .. _pyaudio_PyPI:           https://pypi.org/project/PyAudio/
 .. _twilio_PyPI:            https://pypi.org/project/twilio/
+.. _beautifulsoup4_PyPI:    https://pypi.org/project/beautifulsoup4/
+.. _numpy_PyPI:             https://pypi.org/project/numpy/
+.. _scipy_PyPI:             https://pypi.org/project/scipy/
+.. _vosk_PyPI:              https://pypi.org/project/vosk/
+.. _ffmpeg_python_PyPI:     https://pypi.org/project/ffmpeg-python/
 
 .. _DMVision_PyPI:          https://pypi.org/project/dmvision/
 .. _DMVision_GitHub:        https://github.com/orbisvicis/dmvision
