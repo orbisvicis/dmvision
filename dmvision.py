@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __author__ = "Yclept Nemo"
 __title__ = "DMVision"
 
@@ -11,6 +11,7 @@ import tempfile
 import math
 import struct
 import itertools
+import functools
 import time
 import datetime
 import json
@@ -55,6 +56,7 @@ from selenium.webdriver.support.ui import Select
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException
 from selenium.common.exceptions import WebDriverException
+from selenium.common.exceptions import StaleElementReferenceException
 
 from twilio.request_validator import RequestValidator
 from twilio.twiml.messaging_response import MessagingResponse
@@ -656,38 +658,19 @@ class DecaptchaFailError(DecaptchaError):
     """
 
 
-def decaptcha(selenium_info, vosk_info, timeout=1, attempts=5, error=False):
-    driver = selenium_info.driver
-    # It is not possible to save a reference to the current frame that remains
-    # valid in other frames. Given the nested frames [a -> b -> c], frame 'c'
-    # is only valid from frame 'b' and not from frames 'a' or 'c'. It follows
-    # there can be no reference to the top-level frame, which can only be
-    # focused via a selenium function. Decaptcha needs access to the top-level
-    # frame and guarantees that on exit, that frame will remain active.
-    try:
-        r = decaptcha_solve(selenium_info, vosk_info, timeout, attempts)
-        if error and not r:
-            raise DecaptchaFailError
-        return r
-    except WebDriverException as e:
-        # Any exception caused by ReCAPTCHA blocking further interactions will
-        # be raised when focus is switched to the popup frame. There is no need
-        # to switch to any other frames.
-        if decaptcha_blocked(driver):
-            raise DecaptchaDOSError from e
-        raise
-    finally:
-        # Unless an exception was raised the top-level frame should already be
-        # focused. For simplicity and as a safeguard against future
-        # modifications, switch to the top-level frame regardless.
-        driver.switch_to.default_content()
+def decaptcha_get_iframe_entry(driver):
+    return driver.find_element_by_css_selector(".g-recaptcha iframe")
+
+def decaptcha_get_iframe_realm(driver):
+    return driver.find_elements_by_css_selector\
+        ("body > div > div > iframe[title*='recaptcha'i]")[-1]
 
 def decaptcha_blocked(driver):
     # Determine if ReCAPTCHA is blocking further interaction.
     els = driver.find_elements_by_css_selector("[class*='doscaptcha'i]")
     return bool(els)
 
-def decaptcha_checked(e_check, timeout, frequency=None):
+def decaptcha_v2_checked(e_check, timeout, frequency=None):
     # Determine if the element is checked (if the captcha passed).
     if not frequency:
         frequency = timeout / 10
@@ -700,6 +683,62 @@ def decaptcha_checked(e_check, timeout, frequency=None):
         return False
     else:
         return True
+
+def decaptcha_v2i_passed(i_realm, from_visible, timeout, frequency=None):
+    # Determine if the captcha has passed by checking if the realm iframe is
+    # visible. To avoid race conditions the status is only updated in response
+    # to changes, such as the element's visibility or validity of the DOM node.
+    # A wait timeout implies the visibility remains unchanged.
+    if not frequency:
+        frequency = timeout / 10
+
+    def on_display_change(driver):
+        try:
+            v = i_realm.is_displayed()
+            c = v != from_visible
+        except StaleElementReferenceException as e:
+            raise TimeoutException(False) from e
+        if c:
+            raise TimeoutException(v)
+        return False
+
+    try:
+        WebDriverWait(i_realm.parent, timeout, frequency).until\
+            (on_display_change, message=from_visible)
+    except TimeoutException as e:
+        v = e.msg
+
+    return not v
+
+def decaptcha_entry(f):
+    @functools.wraps(f)
+    def wrapper(selenium_info, *args, timeout=1, attempts=5, error=False):
+        driver = selenium_info.driver
+        # It is not possible to save a reference to the current frame that
+        # remains valid in other frames. Given the nested frames [a -> b -> c],
+        # frame 'c' is only valid from frame 'b' and not from frames 'a' or
+        # 'c'. It follows there can be no reference to the top-level frame,
+        # which can only be focused via a selenium function. Decaptcha needs
+        # access to the top-level frame and guarantees that on exit, that frame
+        # will remain active.
+        try:
+            r = f(selenium_info, *args, timeout=timeout, attempts=attempts)
+            if error and not r:
+                raise DecaptchaFailError
+            return r
+        except WebDriverException as e:
+            # Any exception caused by ReCAPTCHA blocking further interactions
+            # will be raised when focus is switched to the popup frame. There
+            # is no need to switch to any other frames.
+            if decaptcha_blocked(driver):
+                raise DecaptchaDOSError from e
+            raise
+        finally:
+            # Unless an exception was raised the top-level frame should already
+            # be focused. For simplicity and as a safeguard against future
+            # modifications, switch to the top-level frame regardless.
+            driver.switch_to.default_content()
+    return wrapper
 
 # Run this javascript to log the times needed to emulate human input:
 #   cel = document.createElement("div");
@@ -720,7 +759,8 @@ def decaptcha_checked(e_check, timeout, frequency=None):
 #   });
 #
 # The double-click behavior is a hack to work around the cross-origin policy.
-def decaptcha_solve(selenium_info, vosk_info, timeout, attempts):
+@decaptcha_entry
+def decaptcha_v2(selenium_info, vosk_info, timeout, attempts):
     # Solve the ReCAPTCHA. This is the function responsible for program flow
     # and so manages the frame focus. All subroutines expect the correct frame
     # to be in focus before executing.
@@ -741,9 +781,8 @@ def decaptcha_solve(selenium_info, vosk_info, timeout, attempts):
     # settings such as the audio/image toggle to be forgotten.
     driver.switch_to.default_content()
 
-    i_entry = driver.find_element_by_css_selector(".g-recaptcha iframe")
-    i_realm = driver.find_elements_by_css_selector\
-        ("body > div > div > iframe[title*='recaptcha'i]")[-1]
+    i_entry = decaptcha_get_iframe_entry(driver)
+    i_realm = decaptcha_get_iframe_realm(driver)
 
     driver.switch_to.frame(i_entry)
 
@@ -755,12 +794,67 @@ def decaptcha_solve(selenium_info, vosk_info, timeout, attempts):
     decaptcha_sample_click(e_check)
 
     # Check that the checkbox is clicked.
-    if decaptcha_checked(e_check, timeout):
+    if decaptcha_v2_checked(e_check, timeout):
         return True
 
     driver.switch_to.default_content()
     driver.switch_to.frame(i_realm)
 
+    decaptcha_audio(driver, timeout, msleep)
+
+    while True:
+        # The elements here are recreated every loop and so must be found again
+        # to avoid a 'StaleElementReferenceException' error.
+        attempts -= 1
+
+        decaptcha_solve(vosk_info, driver, timeout, msleep)
+
+        driver.switch_to.default_content()
+        driver.switch_to.frame(i_entry)
+
+        # Check that the checkbox is clicked.
+        if decaptcha_v2_checked(e_check, timeout):
+            return True
+
+        if attempts <= 0:
+            return False
+
+        driver.switch_to.default_content()
+        driver.switch_to.frame(i_realm)
+
+@decaptcha_entry
+def decaptcha_v2i(selenium_info, vosk_info, i_realm, timeout, attempts):
+    # See the documentation for 'decaptcha_v2'.
+    driver = selenium_info.driver
+    msleep = MarkSleeper()
+
+    driver.switch_to.default_content()
+
+    if decaptcha_v2i_passed(i_realm, False, timeout):
+        return True
+
+    driver.switch_to.frame(i_realm)
+
+    # switch to audio
+    decaptcha_audio(driver, timeout, msleep, sec_audio=0)
+
+    while True:
+        attempts -= 1
+
+        # solve captcha
+        decaptcha_solve(vosk_info, driver, timeout, msleep)
+
+        driver.switch_to.default_content()
+
+        if decaptcha_v2i_passed(i_realm, True, timeout):
+            return True
+
+        if attempts <= 0:
+            return False
+
+        driver.switch_to.frame(i_realm)
+
+def decaptcha_audio(driver, timeout, mark_sleeper, sec_audio=0.875):
     # Switch to an audio captcha. The error message from a blocked captcha here
     # will obscure the audio button. Clicking the audio button will raise an
     # 'ElementClickInterceptedException' error.
@@ -780,52 +874,45 @@ def decaptcha_solve(selenium_info, vosk_info, timeout, attempts):
     # interface.
     el = WebDriverWait(driver, timeout).until\
         (lambda d: d.find_element_by_id("recaptcha-audio-button"))
-    msleep.sleep(0.875)
+    mark_sleeper.sleep(sec_audio)
     decaptcha_sample_click(el)
 
-    while True:
-        # The elements here are recreated every loop and so must be found again
-        # to avoid a 'StaleElementReferenceException' error.
-        attempts -= 1
-        # Play the audio; only the click is synchronous. A blocked captcha here
-        # will show an error message rather than the expected dialog and so the
-        # click will raise a 'NoSuchElementException' error.
-        el = WebDriverWait(driver, timeout).until\
-            (lambda d: d.find_element_by_css_selector
-                (".rc-audiochallenge-play-button > button"))
-        msleep.sleep(0.75)
-        decaptcha_sample_click(el)
+def decaptcha_solve\
+    ( vosk_info, driver, timeout, mark_sleeper
+    , sec_play=0.75, sec_input=2.0
+    ):
+    # Mute the (only) audio element via synchronous javascript. A blocked
+    # captcha does not load the audio element and so this will raise a
+    # 'NoSuchElementException' error.
+    el = WebDriverWait(driver, timeout).until\
+        (lambda d: d.find_element_by_id("audio-source"))
+    driver.execute_script("arguments[0].muted = true;", el)
+    # Play the audio; only the click is synchronous. A blocked captcha here
+    # will show an error message rather than the expected dialog and so the
+    # click will raise a 'NoSuchElementException' error.
+    el = WebDriverWait(driver, timeout).until\
+        (lambda d: d.find_element_by_css_selector
+            (".rc-audiochallenge-play-button > button"))
+    mark_sleeper.sleep(sec_play)
+    decaptcha_sample_click(el)
 
-        # Get the audio download link.
-        el = WebDriverWait(driver, timeout).until\
-            (lambda d: d.find_element_by_class_name
-                ("rc-audiochallenge-tdownload-link"))
-        url = el.get_attribute("href")
+    # Get the audio download link.
+    el = WebDriverWait(driver, timeout).until\
+        (lambda d: d.find_element_by_class_name
+            ("rc-audiochallenge-tdownload-link"))
+    url = el.get_attribute("href")
 
-        # Run speech recognition from a temporary directory.
-        vosk_sr_m = lambda f: vosk_sr(f, vosk_info.model)
-        with tempfile.TemporaryDirectory() as dirpath:
-            txt = vosk_sr_m(vosk_convert(decaptcha_download(dirpath, url)))
+    # Run speech recognition from a temporary directory.
+    vosk_sr_m = lambda f: vosk_sr(f, vosk_info.model)
+    with tempfile.TemporaryDirectory() as dirpath:
+        txt = vosk_sr_m(vosk_convert(decaptcha_download(dirpath, url)))
 
-        # Input the audio response text.
-        el = WebDriverWait(driver, timeout).until\
-            (lambda d: d.find_element_by_id("audio-response"))
-        msleep.sleep(2.0)
-        decaptcha_sample_click(el)
-        el.send_keys(txt + WebDriverKeys.ENTER)
-
-        driver.switch_to.default_content()
-        driver.switch_to.frame(i_entry)
-
-        # Check that the checkbox is clicked.
-        if decaptcha_checked(e_check, timeout):
-            return True
-
-        if attempts <= 0:
-            return False
-
-        driver.switch_to.default_content()
-        driver.switch_to.frame(i_realm)
+    # Input the audio response text.
+    el = WebDriverWait(driver, timeout).until\
+        (lambda d: d.find_element_by_id("audio-response"))
+    mark_sleeper.sleep(sec_input)
+    decaptcha_sample_click(el)
+    el.send_keys(txt + WebDriverKeys.ENTER)
 
 def decaptcha_sample_click(el):
     # Click the element in a more natural fashion. Click duration is given by a
@@ -1828,12 +1915,13 @@ def road_autofill(appt_info, selenium_info, vosk_info, timeout=5):
     Select(driver.find_element_by_id("permitClass"))\
         .select_by_value("D")
 
+    i_realm = decaptcha_get_iframe_realm(driver)
+
     driver.find_element_by_css_selector("input.btn[value='submit'i]")\
         .click()
 
-    # The road test form is protected by reCAPTCHA v2 Invisible, which must be
-    # handled after the form is submitted, but also which has yet to become an
-    # issue.
+    # Decaptcha errors are handled in the parent.
+    decaptcha_v2i(selenium_info, vosk_info, i_realm, error=True)
 
     # TimeoutException is handled in the parent.
     el = WebDriverWait(driver, timeout).until\
@@ -1865,7 +1953,7 @@ def permit_autofill(appt_info, selenium_info, vosk_info, timeout=5):
         .select_by_value("Class D")
 
     # Decaptcha errors are handled in the parent.
-    decaptcha(selenium_info, vosk_info, error=True)
+    decaptcha_v2(selenium_info, vosk_info, error=True)
 
     driver.find_element_by_css_selector("input.btn[value='submit'i]")\
         .click()
@@ -1899,7 +1987,7 @@ def knowledge_autofill(appt_info, selenium_info, vosk_info, timeout=5):
         .select_by_value("Auto")
 
     # Decaptcha errors are handled in the parent.
-    decaptcha(selenium_info, vosk_info, error=True)
+    decaptcha_v2(selenium_info, vosk_info, error=True)
 
     driver.find_element_by_css_selector("input.btn[value='submit'i]")\
         .click()
