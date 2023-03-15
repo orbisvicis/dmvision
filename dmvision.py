@@ -637,7 +637,7 @@ class MarkSleeper:
     def sleep(self, secs):
         since = self.since
         if since:
-            secs = self.since + secs - time.monotonic()
+            secs = since + secs - time.monotonic()
         if secs > 0:
             time.sleep(secs)
         self.mark()
@@ -1915,13 +1915,11 @@ def road_autofill(appt_info, selenium_info, vosk_info, timeout=5):
     Select(driver.find_element_by_id("permitClass"))\
         .select_by_value("D")
 
-    i_realm = decaptcha_get_iframe_realm(driver)
-
     driver.find_element_by_css_selector("input.btn[value='submit'i]")\
         .click()
 
-    # Decaptcha errors are handled in the parent.
-    decaptcha_v2i(selenium_info, vosk_info, i_realm, error=True)
+    # The road test form is protected by reCAPTCHA v3 with permissive score
+    # handling, and so has yet to become an issue.
 
     # TimeoutException is handled in the parent.
     el = WebDriverWait(driver, timeout).until\
@@ -2012,18 +2010,26 @@ def get_availabilities(id_type, ids_names, id_state, logger):
     avail_all = {}
     headers = {"Referer": url_base}
 
+    BreakError = type("BreakError", (Exception,), {})
+
     # Get the complete availability dataset and check for missing locations.
-    r = requests.get(url_appt, headers=headers)
-    if r.status_code != requests.codes.ok:
-        m = "Error: unable to request collected availability"
-        logger(m, file=sys.stderr)
-    else:
-        avail_all = json.loads(r.text)
+    try:
+        r = requests.get(url_appt, headers=headers)
+        if r.status_code != requests.codes.ok:
+            m = "Error: unable to request collected availability"
+            raise BreakError
+        r = re.search(r"var\s+timeData\s*=\s*(\[.*\])", r.text)
+        if not r:
+            m = "Error: unknown format for collected availability"
+            raise BreakError
+        avail_all = json.loads(r.group(1))
+        avail_all = {i["LocationId"]:i["FirstOpenSlot"] for i in avail_all}
         if len(avail_all) != len(ids_names):
             m = "Warning: collected availability contains {} of {} locations"
             m = m.format(len(avail_all), len(ids_names))
-            logger(m, file=sys.stderr)
-        avail_all = {i["LocationId"]:i["FirstOpenSlot"] for i in r}
+            raise BreakError
+    except BreakError:
+        logger(m, file=sys.stderr)
 
     # Get the relevant locations from the complete dataset, skipping any
     # unknown responses.

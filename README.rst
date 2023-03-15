@@ -75,7 +75,11 @@ server.
 
     # Configure the web application. You will want to configure this
     # server (or a reverse proxy to this server such as ngrok) as the
-    # webhook for your Twilio number.
+    # webhook for your Twilio number. This server runs on port 8080,
+    # and to reverse proxy it through an ngrok subdomain, run:
+    #   ngrok http 8080
+    # Then use this subdomain as the webhook for your Twilio number:
+    #   https://username:password@<*.ngrok.io>/sms
     server_info = dmvision.ServerInfo\
         ( username = "test"
         , password = "test"
